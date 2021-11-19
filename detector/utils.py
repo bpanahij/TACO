@@ -1,8 +1,4 @@
 """
-TODO: Confusion Matrices
-- Zoom Ins
-- fuse
-
 Mask R-CNN
 Common utility functions and classes.
 
@@ -13,6 +9,7 @@ Written by Waleed Abdulla
 
 import sys
 import os
+import logging
 import math
 import random
 import numpy as np
@@ -24,9 +21,7 @@ import skimage.transform
 import urllib.request
 import shutil
 import warnings
-
-# from pycocotools.cocoeval import COCOeval
-from pycocotools import mask as maskUtils
+from distutils.version import LooseVersion
 
 # URL from which to download the latest COCO trained weights
 COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
@@ -70,7 +65,7 @@ def compute_iou(box, boxes, box_area, boxes_area):
     boxes_area: array of length boxes_count.
 
     Note: the areas are passed in rather than calculated here for
-          efficency. Calculate once in the caller to avoid duplicate work.
+    efficiency. Calculate once in the caller to avoid duplicate work.
     """
     # Calculate intersection areas
     y1 = np.maximum(box[0], boxes[:, 0])
@@ -103,10 +98,14 @@ def compute_overlaps(boxes1, boxes2):
 
 
 def compute_overlaps_masks(masks1, masks2):
-    '''Computes IoU overlaps between two sets of masks.
+    """Computes IoU overlaps between two sets of masks.
     masks1, masks2: [Height, Width, instances]
-    '''
-    # flatten masks
+    """
+    
+    # If either set of masks is empty return empty result
+    if masks1.shape[-1] == 0 or masks2.shape[-1] == 0:
+        return np.zeros((masks1.shape[-1], masks2.shape[-1]))
+    # flatten masks and compute their areas
     masks1 = np.reshape(masks1 > .5, (-1, masks1.shape[-1])).astype(np.float32)
     masks2 = np.reshape(masks2 > .5, (-1, masks2.shape[-1])).astype(np.float32)
     area1 = np.sum(masks1, axis=0)
@@ -121,7 +120,7 @@ def compute_overlaps_masks(masks1, masks2):
 
 
 def non_max_suppression(boxes, scores, threshold):
-    """Performs non-maximum supression and returns indicies of kept boxes.
+    """Performs non-maximum suppression and returns indices of kept boxes.
     boxes: [N, (y1, x1, y2, x2)]. Notice that (y2, x2) lays outside the box.
     scores: 1-D array of box scores.
     threshold: Float. IoU threshold to use for filtering.
@@ -148,10 +147,10 @@ def non_max_suppression(boxes, scores, threshold):
         # Compute IoU of the picked box with the rest
         iou = compute_iou(boxes[i], boxes[ixs[1:]], area[i], area[ixs[1:]])
         # Identify boxes with IoU over the threshold. This
-        # returns indicies into ixs[1:], so add 1 to get
-        # indicies into ixs.
+        # returns indices into ixs[1:], so add 1 to get
+        # indices into ixs.
         remove_ixs = np.where(iou > threshold)[0] + 1
-        # Remove indicies of the picked and overlapped boxes.
+        # Remove indices of the picked and overlapped boxes.
         ixs = np.delete(ixs, remove_ixs)
         ixs = np.delete(ixs, 0)
     return np.array(pick, dtype=np.int32)
@@ -181,14 +180,12 @@ def apply_box_deltas(boxes, deltas):
     return np.stack([y1, x1, y2, x2], axis=1)
 
 
-def box_refinement_graph(box, gt_box, dtype_str):
+def box_refinement_graph(box, gt_box):
     """Compute refinement needed to transform box to gt_box.
     box and gt_box are [N, (y1, x1, y2, x2)]
     """
-    tensor_dtype = tf.float32
-
-    box = tf.cast(box, tensor_dtype)
-    gt_box = tf.cast(gt_box, tensor_dtype)
+    box = tf.cast(box, tf.float32)
+    gt_box = tf.cast(gt_box, tf.float32)
 
     height = box[:, 2] - box[:, 0]
     width = box[:, 3] - box[:, 1]
@@ -202,8 +199,8 @@ def box_refinement_graph(box, gt_box, dtype_str):
 
     dy = (gt_center_y - center_y) / height
     dx = (gt_center_x - center_x) / width
-    dh = tf.log(gt_height / height)
-    dw = tf.log(gt_width / width)
+    dh = tf.math.log(gt_height / height)
+    dw = tf.math.log(gt_width / width)
 
     result = tf.stack([dy, dx, dh, dw], axis=1)
     return result
@@ -344,24 +341,13 @@ class Dataset(object):
         assert info['source'] == source
         return info['id']
 
-    def append_data(self, class_info, image_info):
-        self.external_to_class_id = {}
-        for i, c in enumerate(self.class_info):
-            for ds, id in c["map"]:
-                self.external_to_class_id[ds + str(id)] = i
-
-        # Map external image IDs to internal ones.
-        self.external_to_image_id = {}
-        for i, info in enumerate(self.image_info):
-            self.external_to_image_id[info["ds"] + str(info["id"])] = i
-
     @property
     def image_ids(self):
         return self._image_ids
 
     def source_image_link(self, image_id):
         """Returns the path or URL to the image.
-        Override this to return a URL to the image if it's availble online for easy
+        Override this to return a URL to the image if it's available online for easy
         debugging.
         """
         return self.image_info[image_id]["path"]
@@ -393,39 +379,10 @@ class Dataset(object):
         """
         # Override this function to load a mask from your dataset.
         # Otherwise, it returns an empty mask.
+        logging.warning("You are using the default load_mask(), maybe you need to define your own one.")
         mask = np.empty([0, 0, 0])
         class_ids = np.empty([0], np.int32)
         return mask, class_ids
-
-# The following two functions are from pycocotools with a few changes.
-
-def annToRLE(ann, height, width):
-    """
-    Convert annotation which can be polygons, uncompressed RLE to RLE.
-    :return: binary mask (numpy 2D array)
-    """
-    segm = ann['segmentation']
-    if isinstance(segm, list):
-        # polygon -- a single object might consist of multiple parts
-        # we merge all parts into one mask rle code
-        rles = maskUtils.frPyObjects(segm, height, width)
-        rle = maskUtils.merge(rles)
-    elif isinstance(segm['counts'], list):
-        # uncompressed RLE
-        rle = maskUtils.frPyObjects(segm, height, width)
-    else:
-        # rle
-        rle = ann['segmentation']
-    return rle
-
-def annToMask(ann, height, width):
-    """
-    Convert annotation which can be polygons, uncompressed RLE, or RLE to binary mask.
-    :return: binary mask (numpy 2D array)
-    """
-    rle = annToRLE(ann, height, width)
-    m = maskUtils.decode(rle)
-    return m
 
 
 def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square"):
@@ -487,9 +444,8 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
 
     # Resize image using bilinear interpolation
     if scale != 1:
-        image = skimage.transform.resize(
-            image, (round(h * scale), round(w * scale)),
-            order=1, mode="constant", preserve_range=True)
+        image = resize(image, (round(h * scale), round(w * scale)),
+                       preserve_range=True)
 
     # Need padding or cropping?
     if mode == "square":
@@ -557,191 +513,6 @@ def resize_mask(mask, scale, padding, crop=None):
         mask = np.pad(mask, padding, mode='constant', constant_values=0)
     return mask
 
-def fuse_instances(predictions, iou_fusion_threshold= 0.85):
-    """
-    Fuse predictions base on mask IoU
-    predictions: Dict with prediction outputs
-    :return:
-    """
-
-    nr_instances = len(predictions['class_ids'])
-    masks_encoded = []
-
-    for i in range(nr_instances):
-        mask = predictions['masks'][:, :, i].astype(np.uint8)
-        masks_encoded.append(maskUtils.encode(np.asfortranarray(mask)))
-
-    # The list S simultaneously stores scores and keeps track of the instances that were checked by setting their score to zero
-    S = 1 - predictions["full_scores"][:,0]
-
-    predictions_fused = {
-        "rois": [],
-        "class_ids": [],
-        "scores": [],
-        "full_scores": [],
-        "masks": [],
-    }
-
-    # Implement greedy fusion (similar to greedy NMS)
-    while(np.sum(S)>0):
-
-        # Sample best scored candidate
-        id = np.argmax(S)
-
-        # Search for matches based on IoU
-        M = []
-        for target_id in range(nr_instances):
-            if target_id != id and S[target_id]>0:
-                if maskUtils.iou([masks_encoded[id]], [masks_encoded[target_id]], [0]) > iou_fusion_threshold:
-                    M.append(target_id)
-                    S[target_id] = 0
-
-        # Fuse
-        full_scores_acc = predictions['full_scores'][id]
-        mask_acc = predictions['masks'][:, :, id].astype(np.uint8)
-        for pair_id in M:
-            full_scores_acc += predictions['full_scores'][pair_id]
-            mask_acc += predictions['masks'][:, :, pair_id].astype(np.uint8)
-
-        full_scores_acc /= np.sum(full_scores_acc)
-
-        if np.argmax(full_scores_acc) != 0:
-
-            predictions_fused['class_ids'].append(np.argmax(full_scores_acc))
-            predictions_fused['full_scores'].append(full_scores_acc)
-            predictions_fused['scores'].append(np.max(full_scores_acc))
-            mask_fused = mask_acc > len(M)/2
-
-            predictions_fused['masks'].append(mask_fused)
-            predictions_fused['rois'].append(extract_bboxes(mask_fused[:,:,np.newaxis])[0])
-
-        S[id] = 0
-
-    predictions_fused['class_ids'] = np.stack(predictions_fused['class_ids'])
-    predictions_fused['rois'] =  np.stack(predictions_fused['rois'])
-    predictions_fused['full_scores'] = np.stack(predictions_fused['full_scores'])
-    predictions_fused['masks'] = np.stack(predictions_fused['masks'],-1)
-
-    return predictions_fused
-
-
-def zoom_in(image, mask, max_dim):
-    """Crops stochastically image around an object to make an image with [max_dim,max_dim] px
-        If the bbox of selected object is larger than [max_dim,max_dim] px then downsize first the image
-        Masks are then updated
-        """
-
-    image_dtype = image.dtype
-    h, w = image.shape[:2]
-    img_max_dim = max(h, w)
-    scale = 1
-    padding = None
-    window = (0, 0, max_dim, max_dim)
-    nr_annotations = np.shape(mask)[-1]
-
-    # Select bbox to zoom in
-    target_id = np.random.randint(nr_annotations)
-    bboxes = extract_bboxes(mask)
-    y1, x1, y2, x2 = bboxes[target_id]
-    bbox_width = x2 - x1
-    bbox_height = y2 - y1
-    bbox_max_dim = max(bbox_width, bbox_height)
-
-    bbox_max_dim_threshold_4_scaling = max_dim * 0.75
-
-    # If bbox is big enough or too big, downsize full image
-    if bbox_max_dim > bbox_max_dim_threshold_4_scaling:
-
-        # Select scale
-        downscale_at_least = min(1., max_dim / bbox_max_dim)
-        downscale_min = max_dim / img_max_dim
-        scale = random.random() * (downscale_at_least - downscale_min) + downscale_min
-
-        # Resize image (anti_aliasing is on by default)
-        image = skimage.transform.resize(image, (np.round(h * scale), np.round(w * scale)), order=1,
-                                         mode="constant", preserve_range=True)
-
-        # Padding to make it square
-        h, w = image.shape[:2]
-        img_max_dim = max(h, w)
-        top_pad = (img_max_dim - h) // 2
-        bottom_pad = img_max_dim - h - top_pad
-        left_pad = (img_max_dim - w) // 2
-        right_pad = img_max_dim - w - left_pad
-        padding = [(top_pad, bottom_pad), (left_pad, right_pad), (0, 0)]
-        image = np.pad(image, padding, mode='constant', constant_values=0).astype(image_dtype)
-        window = (top_pad, left_pad, h + top_pad, w + left_pad)
-
-        # Adjust mask and target bbox
-        mask = resize_mask(mask, scale, padding)
-        bboxes = extract_bboxes(mask)
-        y1, x1, y2, x2 = bboxes[target_id]
-        h, w = image.shape[:2]
-
-
-    # Select crop around target
-    x0_min = max(x2 - max_dim, 0)
-    x0_max = min(x1, w - max_dim)
-    x0 = random.randint(x0_min, x0_max)
-    y0_min = max(y2 - max_dim, 0)
-    y0_max = min(y1, h - max_dim)
-    y0 = random.randint(y0_min, y0_max)
-
-    # Crop
-    crop = (y0, x0, max_dim, max_dim)
-    image = image[y0:y0 + max_dim, x0:x0 + max_dim]
-    mask = mask[y0:y0 + max_dim, x0:x0 + max_dim]
-
-    # Rectify window
-    if padding:
-        window = (max(top_pad,y0)-y0, max(left_pad,x0)-x0, min(window[2],y0+max_dim)-y0, min(window[3],x0+max_dim)-x0)
-
-    return image, mask, window, scale
-
-
-def compute_confusion_matrix(detections, dataset, iou_min=0.75, score_min = 50):
-    '''
-
-    :predictions: List of predicted instances
-    :param dataset:
-    :return:
-    '''
-    nr_classes = len(dataset.getCatIds())+1
-    confusion_matrix = np.zeros((nr_classes,nr_classes))
-
-    for img in dataset.dataset['images']:
-        img_id = img['id']
-        #  Get annotations per image
-        gts = dataset.loadAnns(dataset.getAnnIds(imgIds=img_id, catIds=[], iscrowd=None))
-        dts = detections.loadAnns(detections.getAnnIds(imgIds=img_id, catIds=[], iscrowd=None))
-
-        #  Get segmentation
-        g_segments = [dataset.annToRLE(g) for g in gts]
-        d_segments = [dataset.annToRLE(d) for d in dts]
-
-        nr_gts = len(gts)
-        nr_dts = len(dts)
-
-        # Compute IoU
-        iscrowd = [0]*nr_gts
-        ious = maskUtils.iou(g_segments, d_segments, iscrowd)
-
-        # Add to confusion matrix
-        if ious != []:
-            for gt_id in range(nr_gts):
-                matches = ious[gt_id,:]>iou_min
-                if np.any(matches):
-                    for dt_id in range(nr_dts):
-                        if matches[dt_id] and dts[dt_id]['score']>score_min:
-                            confusion_matrix[dts[dt_id]['category_id'], gts[gt_id]['category_id']]+= 1
-                else:
-                    confusion_matrix[0,gts[gt_id]['category_id']] += 1
-
-            for dt_id in range(nr_dts):
-                if dts[dt_id]['score']>score_min and not np.any(ious[:,dt_id]>iou_min):
-                    confusion_matrix[dts[dt_id]['category_id'],0] += 1
-
-    return confusion_matrix
 
 def minimize_mask(bbox, mask, mini_shape):
     """Resize masks to a smaller version to reduce memory load.
@@ -758,7 +529,7 @@ def minimize_mask(bbox, mask, mini_shape):
         if m.size == 0:
             raise Exception("Invalid bounding box with area of zero")
         # Resize with bilinear interpolation
-        m = skimage.transform.resize(m, mini_shape, order=1, mode="constant")
+        m = resize(m, mini_shape)
         mini_mask[:, :, i] = np.around(m).astype(np.bool)
     return mini_mask
 
@@ -776,7 +547,7 @@ def expand_mask(bbox, mini_mask, image_shape):
         h = y2 - y1
         w = x2 - x1
         # Resize with bilinear interpolation
-        m = skimage.transform.resize(m, (h, w), order=1, mode="constant")
+        m = resize(m, (h, w))
         mask[y1:y2, x1:x2, i] = np.around(m).astype(np.bool)
     return mask
 
@@ -796,7 +567,7 @@ def unmold_mask(mask, bbox, image_shape):
     """
     threshold = 0.5
     y1, x1, y2, x2 = bbox
-    mask = skimage.transform.resize(mask, (y2 - y1, x2 - x1), order=1, mode="constant")
+    mask = resize(mask, (y2 - y1, x2 - x1))
     mask = np.where(mask >= threshold, 1, 0).astype(np.bool)
 
     # Put the mask in the right location.
@@ -925,7 +696,7 @@ def compute_matches(gt_boxes, gt_class_ids, gt_masks,
         # 3. Find the match
         for j in sorted_ixs:
             # If ground truth box is already matched, go to next one
-            if gt_match[j] > 0:
+            if gt_match[j] > -1:
                 continue
             # If we reach IoU smaller than the threshold, end the loop
             iou = overlaps[i, j]
@@ -1071,11 +842,6 @@ def download_trained_weights(coco_model_path, verbose=1):
 
     coco_model_path: local path of COCO trained weights
     """
-
-    subdir = os.path.dirname(coco_model_path)
-    if not os.path.isdir(subdir):
-        os.mkdir(subdir)
-
     if verbose > 0:
         print("Downloading pretrained model to " + coco_model_path + " ...")
     with urllib.request.urlopen(COCO_MODEL_URL) as resp, open(coco_model_path, 'wb') as out:
@@ -1116,3 +882,27 @@ def denorm_boxes(boxes, shape):
     scale = np.array([h - 1, w - 1, h - 1, w - 1])
     shift = np.array([0, 0, 1, 1])
     return np.around(np.multiply(boxes, scale) + shift).astype(np.int32)
+
+
+def resize(image, output_shape, order=1, mode='constant', cval=0, clip=True,
+           preserve_range=False, anti_aliasing=False, anti_aliasing_sigma=None):
+    """A wrapper for Scikit-Image resize().
+
+    Scikit-Image generates warnings on every call to resize() if it doesn't
+    receive the right parameters. The right parameters depend on the version
+    of skimage. This solves the problem by using different parameters per
+    version. And it provides a central place to control resizing defaults.
+    """
+    if LooseVersion(skimage.__version__) >= LooseVersion("0.14"):
+        # New in 0.14: anti_aliasing. Default it to False for backward
+        # compatibility with skimage 0.13.
+        return skimage.transform.resize(
+            image, output_shape,
+            order=order, mode=mode, cval=cval, clip=clip,
+            preserve_range=preserve_range, anti_aliasing=anti_aliasing,
+            anti_aliasing_sigma=anti_aliasing_sigma)
+    else:
+        return skimage.transform.resize(
+            image, output_shape,
+            order=order, mode=mode, cval=cval, clip=clip,
+            preserve_range=preserve_range)
