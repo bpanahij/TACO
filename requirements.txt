@@ -7,3 +7,5 @@ matplotlib
 seaborn
 graphviz
 Cython
+tensorflow
+imgaug
