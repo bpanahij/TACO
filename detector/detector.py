@@ -292,11 +292,11 @@ if __name__ == '__main__':
     if args.model.lower() == "coco":
         # Exclude the last layers because they require a matching
         # number of classes
-        model.load_weights(model_path, None, by_name=True, exclude=[
+        model.load_weights(model_path, by_name=True, exclude=[
             "mrcnn_class_logits", "mrcnn_bbox_fc",
             "mrcnn_bbox", "mrcnn_mask"])
     else:
-        model.load_weights(model_path, model_path, by_name=True)
+        model.load_weights(model_path, by_name=True)
 
     # Train or evaluate
     if args.command == "train":
