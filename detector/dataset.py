@@ -185,7 +185,7 @@ class Taco(utils.Dataset):
         for annotation in annotations:
             class_id = self.map_source_class_id("taco.{}".format(annotation['category_id']))
             if class_id:
-                m = utils.annToMask(annotation, image_info["height"],image_info["width"])
+                m = coco.annToMask(annotation, image_info["height"],image_info["width"])
                 # Some objects are so small that they're less than 1 pixel area
                 # and end up rounded out. Skip those objects.
                 if m.max() < 1:
